@@ -1,0 +1,1785 @@
+#!/usr/bin/env -S uv run --quiet --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["textual>=1.0", "rich>=13"]
+# ///
+"""dkr — a clean, interactive dashboard for Docker / Podman and Compose.
+
+  dkr              open the full-screen dashboard
+  dkr ps [-a] [-g] print a readable, grouped container table and exit
+  dkr prune        open the clean-up screen
+  dkr <args...>    pass through to `compose` (inside a compose project) or the engine
+"""
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+
+from rich.console import Console, Group
+from rich.syntax import Syntax
+from rich.table import Table
+from rich.text import Text
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Engine layer — plain functions, no UI
+# ─────────────────────────────────────────────────────────────────────────────
+
+COMPOSE_FILES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+L_PROJECT = "com.docker.compose.project"
+L_SERVICE = "com.docker.compose.service"
+L_WORKDIR = "com.docker.compose.project.working_dir"
+L_FILES = "com.docker.compose.project.config_files"
+L_NUMBER = "com.docker.compose.container-number"
+BUILTIN_NETWORKS = {"bridge", "host", "none", "podman"}
+
+
+@dataclass
+class Engine:
+    name: str  # "docker" | "podman"
+    compose: list[str]  # e.g. ["docker", "compose"]
+
+    @property
+    def fmt(self) -> str:
+        """--format value that yields JSON (one object per line for docker, an array for podman)."""
+        return "json" if self.name == "podman" else "{{json .}}"
+
+
+def detect_engine() -> Engine:
+    want = os.environ.get("DKR_ENGINE")
+    order = [want] if want else ["docker", "podman"]
+    for name in order:
+        if name and shutil.which(name):
+            if name == "podman" and not _has_subcommand("podman", "compose") and shutil.which("podman-compose"):
+                return Engine(name, ["podman-compose"])
+            return Engine(name, [name, "compose"])
+    sys.exit("dkr: neither docker nor podman found on PATH (set DKR_ENGINE to override)")
+
+
+def _has_subcommand(cmd: str, sub: str) -> bool:
+    try:
+        return subprocess.run([cmd, sub, "version"], capture_output=True, timeout=5).returncode == 0
+    except Exception:
+        return False
+
+
+def run(cmd: list[str], timeout: float = 30, cwd: str | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=cwd)
+
+
+def run_json(cmd: list[str], timeout: float = 30) -> list[dict]:
+    """Run a command whose output is JSON lines or a JSON array; return a list of objects."""
+    r = run(cmd, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip() or f"{' '.join(cmd[:3])} failed")
+    out = r.stdout.strip()
+    if not out:
+        return []
+    if out.startswith("["):
+        return json.loads(out)
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def pick(d: dict, *keys, default=""):
+    """First present, non-empty value among `keys` (docker and podman name things differently)."""
+    for k in keys:
+        v = d.get(k)
+        if v not in (None, "", "N/A"):
+            return v
+    return default
+
+
+@dataclass
+class Container:
+    id: str
+    name: str
+    image: str
+    state: str  # running | exited | paused | restarting | created | dead
+    status: str  # human status from the engine, e.g. "Up 2 hours (healthy)"
+    ports: str  # raw ports string, e.g. "0.0.0.0:8080->80/tcp, [::]:8080->80/tcp"
+    labels: dict[str, str] = field(default_factory=dict)
+    command: str = ""
+    created: str = ""
+    mounts: list[str] = field(default_factory=list)  # volume names / bind paths
+    networks: list[str] = field(default_factory=list)
+
+    @property
+    def project(self) -> str | None:
+        return self.labels.get(L_PROJECT) or None
+
+    @property
+    def service(self) -> str | None:
+        return self.labels.get(L_SERVICE) or None
+
+    @property
+    def running(self) -> bool:
+        return self.state == "running"
+
+
+_LABEL_SPLIT = re.compile(r",(?=[\w.\-/]+=)")
+
+
+def parse_labels(raw) -> dict[str, str]:
+    """Docker gives labels as one comma-joined string (values may contain commas); podman gives a dict."""
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    out: dict[str, str] = {}
+    for part in _LABEL_SPLIT.split(raw or ""):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k] = v
+    return out
+
+
+def _as_list(raw) -> list[str]:
+    if isinstance(raw, list):
+        return [str(x) for x in raw]
+    return [x.strip() for x in str(raw or "").split(",") if x.strip()]
+
+
+def _podman_ports(ports) -> str:
+    if not isinstance(ports, list):
+        return str(ports or "")
+    bits = []
+    for p in ports:
+        proto = p.get("protocol", "tcp")
+        host_ip = p.get("host_ip") or "0.0.0.0"
+        hp, cp, rng = p.get("host_port"), p.get("container_port"), int(p.get("range") or 1)
+        hps = f"{hp}-{hp + rng - 1}" if rng > 1 and hp else str(hp)
+        cps = f"{cp}-{cp + rng - 1}" if rng > 1 else str(cp)
+        bits.append(f"{host_ip}:{hps}->{cps}/{proto}" if hp else f"{cps}/{proto}")
+    return ", ".join(bits)
+
+
+def parse_container(d: dict) -> Container:
+    names = d.get("Names", "")
+    if isinstance(names, list):
+        names = names[0] if names else ""
+    cmd = d.get("Command", "")
+    if isinstance(cmd, list):
+        cmd = " ".join(cmd)
+    state = str(d.get("State", "")).lower()
+    status = d.get("Status") or state.capitalize()
+    return Container(
+        id=str(d.get("ID") or d.get("Id") or "")[:12],
+        name=str(names).lstrip("/"),
+        image=str(d.get("Image", "")),
+        state=state,
+        status=str(status),
+        ports=_podman_ports(d.get("Ports")) if isinstance(d.get("Ports"), list) else str(d.get("Ports") or ""),
+        labels=parse_labels(d.get("Labels")),
+        command=str(cmd).strip('"'),
+        created=str(d.get("CreatedAt") or d.get("Created") or ""),
+        mounts=_as_list(d.get("Mounts")),
+        networks=_as_list(d.get("Networks")),
+    )
+
+
+def list_containers(engine: Engine) -> list[Container]:
+    return [parse_container(d) for d in run_json([engine.name, "ps", "-a", "--no-trunc", "--format", engine.fmt])]
+
+
+def list_stats(engine: Engine) -> dict[str, tuple[str, str]]:
+    """id -> (cpu%, mem used). Slow-ish (~2s), call from a background thread."""
+    r = run([engine.name, "stats", "--no-stream", "--format", "{{json .}}"], timeout=20)
+    stats: dict[str, tuple[str, str]] = {}
+    if r.returncode != 0:
+        return stats
+    for line in r.stdout.splitlines():
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        cid = str(d.get("ID") or d.get("ContainerID") or d.get("Id") or "")[:12]
+        mem = str(d.get("MemUsage") or d.get("mem_usage") or "").split("/")[0].strip()
+        stats[cid] = (str(d.get("CPUPerc") or d.get("cpu_percent") or "").strip(), mem.replace("iB", "B"))
+    return stats
+
+
+def inspect(engine: Engine, kind: str, ident: str) -> dict:
+    sub = {"container": [], "image": ["image"], "volume": ["volume"], "network": ["network"]}[kind]
+    r = run([engine.name, *sub, "inspect", ident])
+    if r.returncode != 0:
+        return {}
+    data = json.loads(r.stdout or "[]")
+    return data[0] if data else {}
+
+
+def engine_version(engine: Engine) -> str:
+    for fmt in ("{{.Server.Version}}", "{{.Client.Version}}"):
+        try:
+            r = run([engine.name, "version", "--format", fmt], timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                return r.stdout.strip()
+        except Exception:
+            pass
+    return "?"
+
+
+# ── Images / volumes / networks ─────────────────────────────────────────────
+
+_SIZE = re.compile(r"([\d.]+)\s*([kKMGTP]?i?B)")
+_MULT = {"B": 1, "KB": 1e3, "MB": 1e6, "GB": 1e9, "TB": 1e12, "PB": 1e15,
+         "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4}
+
+
+def parse_size(s) -> int:
+    if isinstance(s, (int, float)):
+        return int(s)
+    m = _SIZE.search(str(s or ""))
+    return int(float(m.group(1)) * _MULT.get(m.group(2).upper(), 1)) if m else 0
+
+
+def fmt_size(n: int) -> str:
+    if n <= 0:
+        return "0 B"
+    for unit, mult in (("TB", 1e12), ("GB", 1e9), ("MB", 1e6), ("kB", 1e3)):
+        if n >= mult:
+            v = n / mult
+            return f"{v:.1f} {unit}" if v < 100 else f"{v:.0f} {unit}"
+    return f"{n} B"
+
+
+@dataclass
+class Resource:
+    kind: str  # image | volume | network
+    id: str  # what to pass to inspect / rm
+    name: str
+    size: int = 0  # bytes (0 = unknown)
+    used_by: list[str] = field(default_factory=list)  # container names
+    labels: dict[str, str] = field(default_factory=dict)
+    created: str = ""
+    extra: dict = field(default_factory=dict)  # kind-specific: tag, driver, scope, anonymous, dangling…
+
+    @property
+    def project(self) -> str | None:
+        return self.labels.get(L_PROJECT) or None
+
+    @property
+    def in_use(self) -> bool:
+        return bool(self.used_by) or bool(self.extra.get("count")) or bool(self.extra.get("builtin"))
+
+
+@dataclass
+class Resources:
+    images: list[Resource] = field(default_factory=list)
+    volumes: list[Resource] = field(default_factory=list)
+    networks: list[Resource] = field(default_factory=list)
+    build_cache: int = 0  # reclaimable bytes
+    loaded: bool = False
+
+
+def image_refs(repo: str, tag: str, iid: str) -> set[str]:
+    refs = {iid[:12], "sha256:" + iid}
+    if repo and repo != "<none>":
+        refs.add(f"{repo}:{tag}")
+        if tag == "latest":
+            refs.add(repo)
+        if repo.startswith("docker.io/library/"):
+            short = repo.removeprefix("docker.io/library/")
+            refs |= {f"{short}:{tag}", short if tag == "latest" else ""}
+    return refs - {""}
+
+
+def load_resources(engine: Engine, containers: list[Container]) -> Resources:
+    res = Resources(loaded=True)
+    df: dict = {}
+    if engine.name == "docker":
+        try:  # one call gives image container-counts, volume sizes/links and build cache (~1s)
+            out = run([engine.name, "system", "df", "-v", "--format", "{{json .}}"], timeout=60)
+            df = json.loads(out.stdout) if out.returncode == 0 and out.stdout.strip() else {}
+        except Exception:
+            df = {}
+
+    # images
+    raw_images = df.get("Images") or run_json([engine.name, "image", "ls", "--format", engine.fmt])
+    for d in raw_images:
+        iid = str(pick(d, "ID", "Id")).removeprefix("sha256:")
+        repo, tag = str(pick(d, "Repository", default="<none>")), str(pick(d, "Tag", default="<none>"))
+        if repo == "<none>" and isinstance(d.get("RepoTags"), list) and d["RepoTags"]:  # podman
+            repo, _, tag = d["RepoTags"][0].rpartition(":")
+        refs = image_refs(repo, tag, iid)
+        users = [c.name for c in containers if c.image in refs or c.image.removeprefix("sha256:")[:12] == iid[:12]]
+        count = pick(d, "Containers", default=0)
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0
+        dangling = repo == "<none>"
+        res.images.append(Resource(
+            "image", iid[:12], f"{repo}:{tag}" if not dangling else "<untagged>",
+            size=parse_size(pick(d, "UniqueSize", "Size", default=0)) or parse_size(pick(d, "Size", default=0)),
+            used_by=users, created=str(pick(d, "CreatedSince", "CreatedAt", "Created")),
+            extra={"count": max(count, len(users)), "dangling": dangling,
+                   "total": parse_size(pick(d, "Size", default=0)), "repo": repo, "tag": tag}))
+
+    # volumes
+    raw_vols = df.get("Volumes") or run_json([engine.name, "volume", "ls", "--format", engine.fmt])
+    for d in raw_vols:
+        name = str(pick(d, "Name"))
+        labels = parse_labels(d.get("Labels"))
+        anonymous = "com.docker.volume.anonymous" in labels or bool(re.fullmatch(r"[0-9a-f]{64}", name))
+        users = [c.name for c in containers if name in c.mounts]
+        links = pick(d, "Links", default=0)
+        try:
+            links = int(links)
+        except (TypeError, ValueError):
+            links = 0
+        res.volumes.append(Resource(
+            "volume", name, name[:12] if anonymous else name, size=parse_size(pick(d, "Size", default=0)),
+            used_by=users, labels=labels,
+            extra={"count": max(links, len(users)), "anonymous": anonymous,
+                   "driver": pick(d, "Driver", default="local"), "mountpoint": pick(d, "Mountpoint")}))
+
+    # networks
+    for d in run_json([engine.name, "network", "ls", "--format", engine.fmt]):
+        name = str(pick(d, "Name", "name"))
+        users = [c.name for c in containers if name in c.networks]
+        res.networks.append(Resource(
+            "network", str(pick(d, "ID", "id", default=name))[:12], name, used_by=users,
+            labels=parse_labels(d.get("Labels") or d.get("labels")), created=str(pick(d, "CreatedAt", "created")),
+            extra={"driver": pick(d, "Driver", "driver"), "scope": pick(d, "Scope", default="local"),
+                   "builtin": name in BUILTIN_NETWORKS, "internal": str(pick(d, "Internal", "internal")) == "true"}))
+
+    res.build_cache = sum(parse_size(b.get("Size")) for b in df.get("BuildCache") or []
+                          if str(b.get("InUse")).lower() != "true")
+    return res
+
+
+def scope_resources(items: list[Resource], project: str | None, containers: list[Container]) -> list[Resource]:
+    """Restrict to what belongs to one compose project: its labels, or used by its containers.
+
+    Users outside the stack are summarised as a count (extra["elsewhere"]) rather than listed.
+    """
+    if not project:
+        return items
+    mine = {c.name for c in containers if c.project == project}
+    out = []
+    for r in items:
+        ours = r.project == project or bool(mine & set(r.used_by))
+        built = r.kind == "image" and str(r.extra.get("repo", "")).startswith(f"{project}-")
+        if ours or built:  # compose-built images are named <project>-<service>
+            local = [u for u in r.used_by if u in mine]
+            out.append(replace(r, used_by=local, extra={**r.extra, "elsewhere": len(r.used_by) - len(local),
+                                                         "count": len(local) or r.extra.get("count", 0)}))
+    return out
+
+
+# ── Clean-up plan ───────────────────────────────────────────────────────────
+
+
+@dataclass
+class PruneItem:
+    key: str
+    title: str
+    explain: str
+    cmd: list[str]
+    count: int = 0
+    size: int = 0
+    names: list[str] = field(default_factory=list)
+    warn: str = ""
+    on: bool = False
+
+
+def build_prune_plan(engine: Engine, containers: list[Container], res: Resources) -> list[PruneItem]:
+    e = engine.name
+    stopped = [c for c in containers if c.state in ("exited", "created", "dead")]
+    dangling = [i for i in res.images if i.extra.get("dangling") and not i.in_use]
+    unused_imgs = [i for i in res.images if not i.in_use]
+    unused_nets = [n for n in res.networks if not n.in_use]
+    unused_vols = [v for v in res.volumes if not v.in_use]
+    items = [
+        PruneItem("containers", "Stopped containers",
+                  "Removes containers that aren't running. Their images and named volumes are kept; "
+                  "compose recreates its containers on the next `up`.",
+                  [e, "container", "prune", "-f"], len(stopped), 0, [c.name for c in stopped], on=True),
+        PruneItem("dangling", "Dangling images",
+                  "Untagged image layers left behind by rebuilds and re-pulls. Nothing uses them.",
+                  [e, "image", "prune", "-f"], len(dangling), sum(i.size for i in dangling),
+                  [i.id for i in dangling], on=True),
+        PruneItem("images", "All unused images",
+                  "Every image no container uses — including tagged ones like postgres:16. "
+                  "They'll be pulled or rebuilt again the next time something needs them.",
+                  [e, "image", "prune", "-a", "-f"], len(unused_imgs), sum(i.size for i in unused_imgs),
+                  [i.name if i.name != "<untagged>" else i.id for i in unused_imgs]),
+        PruneItem("networks", "Unused networks",
+                  "Custom networks no container is attached to. Compose recreates them on `up`.",
+                  [e, "network", "prune", "-f"], len(unused_nets), 0, [n.name for n in unused_nets], on=True),
+        PruneItem("volumes", "Unused volumes",
+                  "Volumes no container is using — this is where databases and uploads live.",
+                  [e, "volume", "prune", "-f"] if e == "podman" else [e, "volume", "prune", "-a", "-f"],
+                  len(unused_vols), sum(v.size for v in unused_vols),
+                  [v.name + (" (anonymous)" if v.extra.get("anonymous") else "") for v in unused_vols],
+                  warn="Deletes the data inside them. This can't be undone."),
+    ]
+    if e == "docker":
+        items.append(PruneItem("cache", "Build cache",
+                               "Cached layers from `docker build`. Safe to remove; the next build will be slower.",
+                               [e, "builder", "prune", "-a", "-f"], 0, res.build_cache, on=True))
+    return items
+
+
+# ── Compose projects ────────────────────────────────────────────────────────
+
+
+@dataclass
+class Project:
+    name: str
+    working_dir: str = ""
+    config_files: list[str] = field(default_factory=list)
+    services: dict[str, dict] = field(default_factory=dict)  # declared services (only known for the cwd project)
+    is_cwd: bool = False
+
+
+def find_compose_file(start: Path | None = None) -> Path | None:
+    d = (start or Path.cwd()).resolve()
+    for folder in (d, *d.parents):
+        for fname in COMPOSE_FILES:
+            if (folder / fname).is_file():
+                return folder / fname
+    return None
+
+
+def load_cwd_project(engine: Engine, start: Path | None = None) -> Project | None:
+    f = find_compose_file(start)
+    if not f:
+        return None
+    proj = Project(name=f.parent.name.lower(), working_dir=str(f.parent), config_files=[str(f)], is_cwd=True)
+    try:
+        r = run(engine.compose + ["-f", str(f), "config", "--format", "json"], cwd=str(f.parent), timeout=20)
+        if r.returncode == 0:
+            cfg = json.loads(r.stdout)
+            proj.name = cfg.get("name") or proj.name
+            proj.services = cfg.get("services") or {}
+    except Exception:
+        pass
+    return proj
+
+
+def collect_projects(containers: list[Container], cwd_project: Project | None) -> dict[str, Project]:
+    projects: dict[str, Project] = {}
+    if cwd_project:
+        projects[cwd_project.name] = cwd_project
+    for c in containers:
+        if not c.project or c.project in projects:
+            continue
+        files = [x for x in c.labels.get(L_FILES, "").split(",") if x]
+        projects[c.project] = Project(c.project, c.labels.get(L_WORKDIR, ""), files)
+    return projects
+
+
+def compose_base(engine: Engine, p: Project) -> tuple[list[str], str | None]:
+    """Command prefix + cwd to run compose against project `p` from anywhere."""
+    cmd = list(engine.compose) + ["-p", p.name]
+    files = [f for f in p.config_files if Path(f).is_file()]
+    for f in files:
+        cmd += ["-f", f]
+    wd = p.working_dir if p.working_dir and Path(p.working_dir).is_dir() else None
+    if wd and files and engine.compose != ["podman-compose"]:
+        cmd += ["--project-directory", wd]
+    return cmd, wd
+
+
+# ── Formatting ──────────────────────────────────────────────────────────────
+
+# One accent, grey for everything secondary, red/green/yellow only when they mean something.
+ACCENT = "cyan"
+MUTED = "#a0a0a0"
+OK, BAD, WARN = "green", "red", "yellow"
+
+_UNITS = {"second": "s", "minute": "m", "hour": "h", "day": "d", "week": "w", "month": "mo", "year": "y"}
+_DUR = re.compile(r"(about\s+)?(an?|\d+|less than an?)\s+(second|minute|hour|day|week|month|year)s?", re.I)
+
+
+def short_duration(s: str) -> str:
+    m = _DUR.search(s)
+    if not m:
+        return ""
+    qty = m.group(2).lower()
+    unit = _UNITS[m.group(3).lower()]
+    if qty.startswith("less"):
+        return f"<1{unit}"
+    return f"{1 if qty in ('a', 'an') else qty}{unit}"
+
+
+def fmt_status(status: str, state: str) -> Text:
+    s = status or state
+    low = s.lower()
+    if "paused" in low:
+        return Text("paused", style=WARN)
+    if low.startswith("restarting"):
+        return Text("restarting", style=WARN)
+    if low.startswith("up"):
+        t = Text(short_duration(s) or "up")
+        if "(healthy)" in low:
+            t.append(" ✓", style=OK)
+        elif "unhealthy" in low:
+            t.append(" ✗ unhealthy", style=BAD)
+        elif "starting" in low:
+            t.append(" … starting", style=WARN)
+        return t
+    m = re.match(r"exited \((-?\d+)\)", low)
+    if m:
+        code = int(m.group(1))
+        ago = short_duration(s)
+        t = Text(f"exit {code}", style=BAD if code not in (0, 130, 137, 143) else MUTED)
+        if ago:
+            t.append(f" · {ago} ago", style=MUTED)
+        return t
+    if low.startswith("created"):
+        return Text("created", style=MUTED)
+    return Text(s, style=MUTED)
+
+
+def fmt_ports(raw: str, published_only: bool = True) -> str:
+    """'0.0.0.0:8080->80/tcp, [::]:8080->80/tcp, 9000/tcp' -> '8080→80' (dedupes v4/v6, drops /tcp)."""
+    seen: list[str] = []
+    for part in (p.strip() for p in (raw or "").split(",")):
+        if not part:
+            continue
+        if "->" in part:
+            host, ctr = part.split("->", 1)
+            hport = host.rsplit(":", 1)[-1]
+            ip = host.rsplit(":", 1)[0] if ":" in host else ""
+            ctr_port, _, proto = ctr.partition("/")
+            item = hport if hport == ctr_port else f"{hport}→{ctr_port}"
+            if ip in ("127.0.0.1", "[::1]", "::1"):
+                item = f"lo:{item}"
+        else:
+            if published_only:
+                continue
+            ctr_port, _, proto = part.partition("/")
+            item = f"({ctr_port})"
+        if proto and proto != "tcp":
+            item += f"/{proto}"
+        if item not in seen:
+            seen.append(item)
+    return "  ".join(seen)
+
+
+def short_image(image: str) -> str:
+    img = image.split("@", 1)[0]
+    if img.startswith("sha256:"):
+        return img[7:19]
+    last = img.rsplit("/", 1)[-1]
+    return last or image
+
+
+def short_ago(s: str) -> str:
+    d = short_duration(s)
+    return f"{d} ago" if d else s
+
+
+DOT = {"running": ("●", OK), "paused": ("●", WARN), "restarting": ("●", WARN),
+       "exited": ("●", BAD), "dead": ("●", BAD), "created": ("○", MUTED), "missing": ("◌", MUTED)}
+
+
+def state_dot(c: Container | None) -> Text:
+    if c is None:
+        return Text(*DOT["missing"])
+    sym, style = DOT.get(c.state, ("○", MUTED))
+    if c.state == "exited" and re.match(r"exited \((0|130|137|143)\)", c.status.lower()):
+        sym, style = "○", MUTED
+    return Text(sym, style=style)
+
+
+def tilde(p: str, max_len: int = 0) -> str:
+    home = str(Path.home())
+    p = "~" + p[len(home):] if p.startswith(home) else p
+    if max_len and len(p) > max_len:
+        parts = p.split("/")
+        tail = parts[-1]
+        for part in reversed(parts[:-1]):
+            if len(tail) + len(part) + 3 > max_len:
+                break
+            tail = f"{part}/{tail}"
+        p = "…/" + tail if len(tail) + 2 <= max_len else "…" + p[-(max_len - 1):]
+    return p
+
+
+def names_preview(names: list[str], n: int = 4) -> str:
+    if not names:
+        return ""
+    more = f" +{len(names) - n} more" if len(names) > n else ""
+    return ", ".join(names[:n]) + more
+
+
+# ── Row model shared by the TUI and `dkr ps` ────────────────────────────────
+
+
+@dataclass
+class Row:
+    key: str
+    kind: str  # "group" | "container" | "service" | "spacer" | "image" | "volume" | "network"
+    project: Project | None = None
+    container: Container | None = None
+    service: str | None = None
+    label: str = ""
+    running: int = 0
+    total: int = 0
+    res: Resource | None = None
+
+
+STANDALONE = "· standalone"
+
+
+def build_rows(containers: list[Container], projects: dict[str, Project], show_stopped: bool = True,
+               filt: str = "", only: str | None = None) -> list[Row]:
+    """Container rows grouped by compose project. `only` limits to one project."""
+    filt = filt.lower().strip()
+
+    def match(c: Container | None, proj: str, svc: str = "") -> bool:
+        if not filt:
+            return True
+        hay = " ".join([proj, svc, c.name if c else "", c.image if c else ""]).lower()
+        return filt in hay
+
+    groups: dict[str, list[Container]] = {}
+    for c in containers:
+        groups.setdefault(c.project or STANDALONE, []).append(c)
+    for name, p in projects.items():
+        if p.is_cwd:
+            groups.setdefault(name, [])
+    if only:
+        groups = {k: v for k, v in groups.items() if k == only}
+
+    def order(name: str) -> tuple:
+        p = projects.get(name)
+        return (0 if p and p.is_cwd else 2 if name == STANDALONE else 1, name)
+
+    rows: list[Row] = []
+    for gname in sorted(groups, key=order):
+        proj = projects.get(gname)
+        ctrs = sorted(groups[gname], key=lambda c: (c.service or c.name, int(c.labels.get(L_NUMBER, "1") or 1)))
+        present = {c.service for c in ctrs}
+        missing = [s for s in (proj.services if proj else {}) if s not in present]
+        body: list[Row] = []
+        for c in ctrs:
+            if (show_stopped or c.running) and match(c, gname, c.service or ""):
+                label = c.service or c.name
+                if c.service and int(c.labels.get(L_NUMBER, "1") or 1) > 1:
+                    label += f" #{c.labels[L_NUMBER]}"
+                body.append(Row(c.id, "container", proj, c, c.service, label))
+        if show_stopped:
+            for s in missing:
+                if match(None, gname, s):
+                    body.append(Row(f"svc:{gname}:{s}", "service", proj, None, s, s))
+        if not body and not (proj and proj.is_cwd and not filt):
+            continue
+        n_run = sum(1 for c in ctrs if c.running)
+        rows.append(Row(f"grp:{gname}", "group", proj, label=gname, running=n_run, total=len(ctrs) + len(missing)))
+        rows.extend(body)
+    return rows
+
+
+def resource_rows(items: list[Resource], filt: str = "") -> list[Row]:
+    filt = filt.lower().strip()
+    items = [r for r in items if not filt or filt in f"{r.name} {r.id} {' '.join(r.used_by)} {r.project or ''}".lower()]
+    items.sort(key=lambda r: (not r.in_use, r.name == "<untagged>", r.name.lower()))
+    return [Row(f"{r.kind}:{r.id}", r.kind, label=r.name, res=r) for r in items]
+
+
+VIEW_COLUMNS = {
+    "containers": ("name", "image", "status", "ports", "cpu", "mem"),
+    "images": ("image", "id", "size", "created", "used by"),
+    "volumes": ("volume", "stack", "size", "driver", "used by"),
+    "networks": ("network", "driver", "scope", "stack", "containers"),
+}
+
+
+def row_cells(r: Row, stats: dict | None = None, selected: bool = False) -> list[Text]:
+    """Cells for one row: marker+dot, then the view's columns."""
+    def lead(dot: Text | None) -> Text:
+        t = Text("▌ " if selected else "  ", style=ACCENT)
+        return t.append_text(dot or Text(" "))
+
+    blank = Text("")
+    if r.kind == "spacer":
+        return [blank] * 7
+    if r.kind == "group":
+        name = Text(r.label, style="bold")
+        if r.project and r.project.is_cwd:
+            name.append("  here", style=ACCENT)
+        where = tilde(r.project.working_dir, 30) if r.project and r.label != STANDALONE else ""
+        return [lead(None), name, Text(where, style=MUTED), Text(f"{r.running}/{r.total} up", style=MUTED),
+                blank, blank, blank]
+    if r.kind == "service":
+        return [lead(state_dot(None)), Text(r.label, style=MUTED), blank, Text("not created", style=MUTED),
+                blank, blank, blank]
+    if r.kind == "container":
+        c = r.container
+        cpu, mem = (stats or {}).get(c.id, ("", "")) if c.running else ("", "")
+        return [lead(state_dot(c)), Text(r.label, style="" if c.running else MUTED),
+                Text(short_image(c.image), style=MUTED), fmt_status(c.status, c.state), Text(fmt_ports(c.ports)),
+                Text(cpu, justify="right"), Text(mem, justify="right")]
+
+    res = r.res
+    dot = Text("●", style=OK) if res.in_use else Text("○", style=MUTED)
+    used = Text(names_preview(res.used_by, 3)) if res.used_by else (
+        Text(f"{res.extra['count']} container(s)") if res.extra.get("count") else Text("unused", style=MUTED))
+    if res.extra.get("elsewhere"):
+        used.append(f"  +{res.extra['elsewhere']} elsewhere", style=MUTED)
+    name = Text(res.name, style="" if res.in_use else MUTED)
+    size = Text(fmt_size(res.size) if res.size else "", justify="right")
+    if r.kind == "image":
+        return [lead(dot), name, Text(res.id, style=MUTED), size, Text(short_ago(res.created), style=MUTED), used]
+    if r.kind == "volume":
+        if res.extra.get("anonymous"):
+            name.append("  anonymous", style=MUTED)
+        return [lead(dot), name, Text(res.project or "", style=MUTED), size,
+                Text(str(res.extra.get("driver", "")), style=MUTED), used]
+    # network
+    if res.extra.get("builtin"):
+        dot = Text("○", style=MUTED)
+        used = Text(names_preview(res.used_by, 3)) if res.used_by else Text("built-in", style=MUTED)
+    return [lead(dot), name, Text(str(res.extra.get("driver", "")), style=MUTED),
+            Text(str(res.extra.get("scope", "")), style=MUTED), Text(res.project or "", style=MUTED), used]
+
+
+def render_ps(engine: Engine, show_stopped: bool, all_stacks: bool = False) -> None:
+    console = Console()
+    containers = list_containers(engine)
+    cwd_project = load_cwd_project(engine)
+    projects = collect_projects(containers, cwd_project)
+    only = cwd_project.name if cwd_project and not all_stacks else None
+    rows = build_rows(containers, projects, show_stopped, only=only)
+    if not rows:
+        console.print(Text("No containers." if show_stopped else "No running containers — try dkr ps -a", style=MUTED))
+        return
+    t = Table(box=None, show_header=True, header_style=MUTED, padding=(0, 3, 0, 0), pad_edge=False)
+    for h in ("", "name", "image", "status", "ports", "id"):
+        t.add_column(h, no_wrap=True, overflow="ellipsis")
+    for i, r in enumerate(rows):
+        c = row_cells(r)
+        if r.kind == "group":
+            if i:
+                t.add_row()
+            t.add_row(Text(""), c[1], c[2], c[3], Text(""), Text(""))
+        else:
+            t.add_row(c[0][2:], c[1], c[2], c[3], c[4], Text(r.container.id if r.container else "", style=MUTED))
+    console.print()
+    console.print(t)
+    if only:
+        console.print(Text(f"\nshowing stack “{only}” only — dkr ps -g for everything", style=MUTED))
+    console.print()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TUI
+# ─────────────────────────────────────────────────────────────────────────────
+
+VIEWS = ("containers", "images", "volumes", "networks")
+
+
+def make_app(engine: Engine, start_prune: bool = False):
+    from rich.rule import Rule
+    from textual import on, work
+    from textual.app import App, ComposeResult, SystemCommand
+    from textual.binding import Binding
+    from textual.containers import Horizontal, VerticalScroll
+    from textual.screen import ModalScreen
+    from textual.widgets import ContentSwitcher, DataTable, Input, RichLog, Static
+    from textual.widgets.data_table import RowDoesNotExist
+
+    def rule(title: Text | str = "", align: str = "center") -> Rule:
+        return Rule(title, style=MUTED, characters="─", align=align)
+
+    def hints(items: list[tuple[str, str]]) -> Text:
+        t = Text(no_wrap=True, overflow="ellipsis")
+        for i, (key, label) in enumerate(items):
+            if i:
+                t.append(" · ", style=MUTED)
+            t.append(key)
+            t.append(f" {label}", style=MUTED)
+        return t
+
+    HINTS = {
+        "containers": [("s", "start"), ("x", "stop"), ("r", "restart"), ("e", "exec"), ("u", "up"),
+                       ("D", "down"), ("b", "build"), ("d", "remove"), ("P", "clean up"), ("?", "more"), ("q", "quit")],
+        "images": [("d", "remove"), ("p", "pull"), ("P", "clean up"), ("/", "filter"), ("?", "more"), ("q", "quit")],
+        "volumes": [("d", "remove"), ("P", "clean up"), ("/", "filter"), ("?", "more"), ("q", "quit")],
+        "networks": [("d", "remove"), ("P", "clean up"), ("/", "filter"), ("?", "more"), ("q", "quit")],
+    }
+    MORE = [("1-4", "views"), ("tab", "pane"), ("g", "this stack / all"), ("/", "filter"), ("U", "up service"),
+            ("p", "pull"), ("z", "zoom"), ("a", "stopped"), ("t", "stats"), ("ctrl+p", "all commands")]
+
+    class Confirm(ModalScreen[bool]):
+        BINDINGS = [("y", "answer(True)"), ("n,escape", "answer(False)")]
+
+        def __init__(self, message: Text) -> None:
+            super().__init__()
+            self.message = message
+
+        def compose(self) -> ComposeResult:
+            body = Text()
+            body.append_text(self.message)
+            body.append("\n\n")
+            body.append("y", style=f"bold {ACCENT}")
+            body.append(" confirm    ", style=MUTED)
+            body.append("n", style="bold")
+            body.append(" cancel", style=MUTED)
+            yield Static(body, id="dialog")
+
+        def action_answer(self, value: bool) -> None:
+            self.dismiss(value)
+
+    class Prune(ModalScreen[list]):
+        """Pick what to clean up; every option says what it removes and what it costs you."""
+        BINDINGS = [("up,k", "move(-1)"), ("down,j", "move(1)"), ("space", "toggle"),
+                    ("enter", "go"), ("escape,q", "cancel")]
+
+        def __init__(self, items: list[PruneItem]) -> None:
+            super().__init__()
+            self.items = items
+            self.cursor = 0
+
+        def compose(self) -> ComposeResult:
+            with VerticalScroll(id="prune"):
+                yield Static(id="prune-body")
+
+        def on_mount(self) -> None:
+            self.redraw()
+
+        def redraw(self) -> None:
+            head = Text()
+            head.append("Clean up Docker\n", style="bold")
+            head.append("Frees disk space across all of Docker, not just this stack.\n", style=MUTED)
+            for i, (k, label) in enumerate((("↑↓", "move"), ("space", "toggle"), ("enter", "review"),
+                                            ("esc", "cancel"))):
+                if i:
+                    head.append("  ·  ", style=MUTED)
+                head.append(k)
+                head.append(f" {label}", style=MUTED)
+            head.append("\n")
+
+            grid = Table.grid(padding=(0, 1))
+            grid.add_column(width=2, no_wrap=True)  # cursor bar
+            grid.add_column(width=3, no_wrap=True)  # checkbox
+            grid.add_column(ratio=1)  # text — wraps within its own column
+            for i, it in enumerate(self.items):
+                sel = i == self.cursor
+                stat = []
+                if it.count:
+                    stat.append(f"{it.count} item{'s' if it.count != 1 else ''}")
+                if it.size:
+                    stat.append(fmt_size(it.size))
+                body = Text()
+                body.append(it.title, style="bold" if sel else ("" if stat else MUTED))
+                body.append("   ")
+                body.append("  ·  ".join(stat) if stat else "nothing to remove", style="" if stat else MUTED)
+                if it.warn:
+                    body.append(f"\n⚠ {it.warn}", style=WARN)
+                body.append(f"\n{it.explain}", style=MUTED)
+                if it.names:
+                    body.append(f"\n{names_preview(it.names, 5)}", style=MUTED)
+                grid.add_row(Text(""), Text(""), Text(""))
+                grid.add_row(Text("▌" if sel else " ", style=ACCENT),
+                             Text("[x]" if it.on else "[ ]", style=ACCENT if it.on else MUTED), body)
+
+            chosen = [it for it in self.items if it.on and (it.count or it.size)]
+            covers = any(c.key == "images" for c in chosen)  # `image prune -a` includes dangling ones
+            total = sum(it.size for it in chosen if not (it.key == "dangling" and covers))
+            foot = Text("\n")
+            foot.append(f"{len(chosen)} selected", style="bold")
+            if total:
+                foot.append(f"  ·  about {fmt_size(total)} to free", style="bold")
+            self.query_one("#prune-body", Static).update(Group(head, grid, foot))
+
+        def action_move(self, step: int) -> None:
+            self.cursor = (self.cursor + step) % len(self.items)
+            self.redraw()
+
+        def action_toggle(self) -> None:
+            it = self.items[self.cursor]
+            it.on = not it.on
+            self.redraw()
+
+        def action_go(self) -> None:
+            self.dismiss([it for it in self.items if it.on and (it.count or it.size)])
+
+        def action_cancel(self) -> None:
+            self.dismiss([])
+
+    class Dkr(App):
+        TITLE = "dkr"
+        CSS = """
+        Screen { background: ansi_default; }
+        #title, #tabbar, #sep2 { height: 1; padding: 0 1; }
+        #views { height: 1; padding: 0 3; margin-top: 1; }
+        #hints { height: auto; padding: 0 3; }
+        #filterbar { height: 1; padding: 0 2; margin-top: 1; }
+        #filter-label { width: auto; }
+        #filter { border: none; height: 1; padding: 0 1; width: 1fr; background: transparent; }
+        #filter:focus { border: none; }
+        #filter > .input--placeholder { color: #a0a0a0; }
+        #count { width: auto; color: #a0a0a0; }
+
+        #table { height: 3fr; background: transparent; margin-top: 1;
+                 scrollbar-size: 1 0; scrollbar-color: #a0a0a0; scrollbar-background: transparent;
+                 scrollbar-color-hover: ansi_white; scrollbar-color-active: ansi_white; }
+        #table > .datatable--header { background: transparent; color: #a0a0a0; text-style: none; }
+        #table > .datatable--cursor { background: #2d2d2d; text-style: bold; }
+        #table > .datatable--hover { background: transparent; }
+        #table > .datatable--header-hover { background: transparent; }
+
+        #pane { height: 2fr; padding: 1 3 0 3; }
+        #pane > * { background: transparent; scrollbar-size: 1 1; scrollbar-color: #a0a0a0;
+                    scrollbar-background: transparent; }
+        #status { height: 1; padding: 0 3; }
+
+        .zoom #filterbar, .zoom #table { display: none; }
+        .zoom #pane { height: 1fr; }
+
+        Confirm, Prune { align: center middle; background: transparent; }
+        #dialog { width: 64; height: auto; padding: 1 3; border: round #a0a0a0; background: ansi_default; }
+        #prune { width: 96; max-width: 100%; height: auto; max-height: 90%; padding: 1 3;
+                 border: round #a0a0a0; background: ansi_default; scrollbar-size: 1 1; }
+        """
+        BINDINGS = [
+            Binding("s", "start"), Binding("x", "stop"), Binding("r", "restart"), Binding("e", "exec"),
+            Binding("u", "up"), Binding("D", "down"), Binding("b", "build"), Binding("d", "remove"),
+            Binding("U", "up_service"), Binding("p", "pull"), Binding("P", "prune"),
+            Binding("1", "view('containers')"), Binding("2", "view('images')"),
+            Binding("3", "view('volumes')"), Binding("4", "view('networks')"),
+            Binding("g", "toggle_scope"),
+            Binding("l", "pane('logs')"), Binding("i", "pane('inspect')"),
+            Binding("tab", "cycle_pane", priority=True), Binding("shift+tab", "cycle_pane(-1)", priority=True),
+            Binding("slash", "filter"), Binding("a", "toggle_stopped"), Binding("t", "toggle_stats"),
+            Binding("z", "zoom"), Binding("question_mark", "more"), Binding("escape", "escape"),
+            Binding("q", "quit"),
+        ]
+
+        def __init__(self) -> None:
+            super().__init__(ansi_color=True)
+            self.engine = engine
+            self.version = "…"
+            self.view = "containers"
+            self.containers: list[Container] = []
+            self.by_id: dict[str, Container] = {}
+            self.res = Resources()
+            self.cwd_project: Project | None = None
+            self.scoped = True  # inside a compose project: show only that stack
+            self.projects: dict[str, Project] = {}
+            self.rows: list[Row] = []
+            self.row_by_key: dict[str, Row] = {}
+            self.stats: dict[str, tuple[str, str]] = {}
+            self.show_stopped = True
+            self.show_stats = True
+            self.show_more = False
+            self.filter_text = ""
+            self.pane = "details"
+            self.selected_key: str | None = None
+            self._last_index = 0
+            self._signature: tuple | None = None
+            self._detail_timer = None
+            self._flash: tuple[Text, float] | None = None
+            self._started = False
+
+        # ── layout ──
+        def compose(self) -> ComposeResult:
+            yield Static(id="title")
+            yield Static(id="views")
+            yield Static(id="hints")
+            with Horizontal(id="filterbar"):
+                yield Static(Text("Filter ›", style=f"bold {ACCENT}"), id="filter-label")
+                yield Input(placeholder="press / to search", id="filter")
+                yield Static(id="count")
+            yield DataTable(id="table", cursor_type="row", cell_padding=2,
+                            cursor_foreground_priority="renderable")
+            yield Static(id="tabbar")
+            with ContentSwitcher(id="pane", initial="details"):
+                yield VerticalScroll(Static(id="details-body"), id="details")
+                yield RichLog(id="logs", max_lines=3000, wrap=False, highlight=False, markup=False)
+                yield VerticalScroll(Static(id="inspect-body"), id="inspect")
+            yield Static(rule(), id="sep2")
+            yield Static(id="status")
+
+        def on_mount(self) -> None:
+            self.setup_columns()
+            self.query_one(DataTable).focus()
+            self.update_chrome()
+            self.load_static()
+            self.refresh_data()
+            self.set_interval(2, self.refresh_data)
+            self.set_interval(5, self.refresh_stats)
+            if start_prune:
+                self.action_prune()
+
+        def setup_columns(self) -> None:
+            t = self.query_one(DataTable)
+            t.clear(columns=True)
+            t.add_column("", key="dot")
+            for i, label in enumerate(VIEW_COLUMNS[self.view]):
+                t.add_column(label, key=f"c{i}")
+
+        def get_system_commands(self, screen):
+            yield from super().get_system_commands(screen)
+            for key, title, help_ in [
+                ("start", "Start", "Start selected container / service / project"),
+                ("stop", "Stop", "Stop selected container / project"),
+                ("restart", "Restart", "Restart selected container / project"),
+                ("exec", "Exec shell", "Open a shell in the selected container"),
+                ("remove", "Remove", "Remove the selected container / image / volume / network"),
+                ("prune", "Clean up / prune", "Free disk space: stopped containers, unused images, cache…"),
+                ("up", "Compose up -d", "Bring the selected / current project up"),
+                ("up_service", "Compose up selected service", "compose up -d <service>"),
+                ("down", "Compose down", "Stop and remove the project's containers"),
+                ("build", "Compose build", "Build the selected service or whole project"),
+                ("pull", "Pull", "Pull the selected image, or compose pull"),
+                ("toggle_scope", "Toggle this stack / all", "Inside a compose project, show only its stack"),
+                ("toggle_stopped", "Toggle stopped containers", "Show / hide stopped containers"),
+                ("toggle_stats", "Toggle CPU / memory stats", "Stats polling is a bit slow"),
+                ("zoom", "Zoom bottom pane", "Full-screen logs / details"),
+            ]:
+                yield SystemCommand(title, help_, getattr(self, f"action_{key}"))
+            for v in VIEWS:
+                yield SystemCommand(f"View {v}", f"Switch to the {v} list", lambda v=v: self.action_view(v))
+
+        # ── chrome ──
+        @property
+        def scope(self) -> str | None:
+            return self.cwd_project.name if self.cwd_project and self.scoped else None
+
+        @property
+        def panes(self) -> tuple[str, ...]:
+            return ("details", "logs", "inspect") if self.view == "containers" else ("details", "inspect")
+
+        def update_chrome(self) -> None:
+            title = Text()
+            title.append(" dkr ", style="bold")
+            if self.scope:
+                title.append("· ", style=MUTED)
+                title.append(self.scope + " ", style="bold")
+            elif self.cwd_project:
+                title.append("· all stacks ", style=MUTED)
+            self.query_one("#title", Static).update(rule(title))
+
+            v = Text(no_wrap=True)
+            for i, name in enumerate(VIEWS, 1):
+                if i > 1:
+                    v.append("    ")
+                v.append(f"{i} ", style=MUTED)
+                v.append(name, style=f"bold {ACCENT}" if name == self.view else "")
+            if self.cwd_project:
+                v.append("        ")
+                v.append("g ", style=MUTED)
+                v.append("show all stacks" if self.scoped else f"only {self.cwd_project.name}", style=MUTED)
+            self.query_one("#views", Static).update(v)
+
+            h = hints(HINTS[self.view])
+            if self.show_more:
+                h.append("\n")
+                h.append_text(hints(MORE))
+            self.query_one("#hints", Static).update(h)
+            self.query_one("#count", Static).update(self.count_text())
+            self.update_tabbar()
+            self.update_status()
+
+        def count_text(self) -> str:
+            if self.view == "containers":
+                cs = [c for c in self.containers if not self.scope or c.project == self.scope]
+                return f"{sum(c.running for c in cs)}/{len(cs)} running"
+            items = [r.res for r in self.rows if r.res]
+            if not self.res.loaded:
+                return "loading…"
+            total = sum(r.size for r in items)
+            unused = sum(1 for r in items if not r.in_use)
+            s = f"{len(items)} {self.view}"
+            if total:
+                s += f"  ·  {fmt_size(total)}"
+            return s + (f"  ·  {unused} unused" if unused else "")
+
+        def update_tabbar(self) -> None:
+            t = Text(" ")
+            for i, name in enumerate(self.panes):
+                if i:
+                    t.append("   ")
+                t.append(name, style=f"bold {ACCENT}" if name == self.pane else MUTED)
+            t.append(" ")
+            self.query_one("#tabbar", Static).update(rule(t, align="left"))
+
+        def update_status(self) -> None:
+            if self._flash and time.monotonic() < self._flash[1]:
+                self.query_one("#status", Static).update(self._flash[0])
+                return
+            self._flash = None
+            t = Text(no_wrap=True, overflow="ellipsis", style=MUTED)
+            t.append(f"{self.engine.name} {self.version}")
+            if self.cwd_project:
+                t.append(f"  ·  {tilde(self.cwd_project.working_dir, 40)}")
+            if not self.show_stopped:
+                t.append("  ·  hiding stopped")
+            if not self.show_stats:
+                t.append("  ·  stats off")
+            self.query_one("#status", Static).update(t)
+
+        def notify(self, message: str, *, title: str = "", severity: str = "information",
+                   timeout: float | None = None, markup: bool = True) -> None:
+            """Messages go to the status line instead of pop-up toasts."""
+            icon, style = {"error": ("✗", BAD), "warning": ("!", WARN)}.get(severity, ("✓", OK))
+            msg = " ".join(f"{title + ': ' if title else ''}{message}".split())
+            t = Text(no_wrap=True, overflow="ellipsis")
+            t.append(f"{icon} ", style=style)
+            t.append(msg, style=style if severity == "error" else "")
+            secs = timeout or 3
+            self._flash = (t, time.monotonic() + secs)
+            self.update_status()
+            self.set_timer(secs + 0.05, self.update_status)
+
+        # ── data loading ──
+        @work(thread=True, group="static")
+        def load_static(self) -> None:
+            v = engine_version(self.engine)
+            p = load_cwd_project(self.engine)
+            self.call_from_thread(self._set_static, v, p)
+
+        def _set_static(self, version: str, project: Project | None) -> None:
+            self.version, self.cwd_project = version, project
+            self._signature = None
+            self.update_chrome()
+            self.refresh_data()
+
+        @work(thread=True, exclusive=True, group="refresh")
+        def refresh_data(self) -> None:
+            try:
+                containers = list_containers(self.engine)
+                res = load_resources(self.engine, containers) if self.view != "containers" else None
+            except Exception as e:  # daemon down etc.
+                self.call_from_thread(self.notify, str(e), severity="error", timeout=4)
+                return
+            self.call_from_thread(self._apply, containers, res)
+
+        @work(thread=True, exclusive=True, group="stats")
+        def refresh_stats(self) -> None:
+            if not self.show_stats or self.view != "containers" or not any(c.running for c in self.containers):
+                return
+            s = list_stats(self.engine)
+            self.call_from_thread(self._apply_stats, s)
+
+        def _apply_stats(self, stats) -> None:
+            self.stats = stats
+            self._apply(self.containers)
+
+        def _apply(self, containers: list[Container], res: Resources | None = None) -> None:
+            first_load = not self._started and containers
+            self._started = self._started or bool(containers)
+            self.containers = containers
+            if res is not None:
+                self.res = res
+            if first_load and self.show_stats:
+                self.refresh_stats()
+            self.by_id = {c.id: c for c in containers}
+            self.projects = collect_projects(containers, self.cwd_project)
+            self.rows = self.compute_rows()
+            self.row_by_key = {r.key: r for r in self.rows}
+            self.update_chrome()
+            self.render_table()
+
+        def compute_rows(self) -> list[Row]:
+            if self.view == "containers":
+                rows: list[Row] = []
+                for r in build_rows(self.containers, self.projects, self.show_stopped, self.filter_text, self.scope):
+                    if r.kind == "group" and rows:
+                        rows.append(Row(f"sp:{r.key}", "spacer"))  # breathing room between groups
+                    rows.append(r)
+                return rows
+            items = getattr(self.res, self.view)
+            return resource_rows(scope_resources(items, self.scope, self.containers), self.filter_text)
+
+        def render_table(self) -> None:
+            t = self.query_one(DataTable)
+            keep = self.selected_key
+            stats = self.stats if self.show_stats else {}
+            cells = {r.key: row_cells(r, stats, r.key == keep) for r in self.rows}
+            sig = (self.view, tuple((k, tuple((c.plain, str(c.style)) for c in v)) for k, v in cells.items()))
+            if sig == self._signature:
+                return
+            self._signature = sig
+            existing = [rk.value for rk in t.rows]
+            cols = [ck.value for ck in t.columns]
+            if existing and existing == [r.key for r in self.rows]:
+                # Same rows: update cells in place (no flicker; cursor and log stream untouched).
+                for r in self.rows:
+                    for col, val in zip(cols, cells[r.key], strict=False):
+                        t.update_cell(r.key, col, val, update_width=True)
+                return
+            t.clear()
+            for r in self.rows:
+                t.add_row(*cells[r.key][:len(cols)], key=r.key)
+            if not self.rows:
+                what = "containers" if self.view == "containers" else self.view
+                msg = "Loading…" if self.view != "containers" and not self.res.loaded else (
+                    f"No {what}" + (f" matching “{self.filter_text}”" if self.filter_text else "")
+                    + (f" in stack {self.scope} — press g to see all" if self.scope else "") + ".")
+                self.query_one("#details-body", Static).update(Text(msg, style=MUTED))
+                self.selected_key = None
+                return
+            first = next((i for i, r in enumerate(self.rows) if r.kind not in ("group", "spacer")), 0)
+            target = first
+            if keep:
+                with contextlib.suppress(RowDoesNotExist):
+                    target = t.get_row_index(keep)
+            t.move_cursor(row=target, animate=False)
+
+        # ── selection → details / logs ──
+        @property
+        def current(self) -> Row | None:
+            return self.row_by_key.get(self.selected_key or "")
+
+        @on(DataTable.RowSelected)
+        def _selected(self) -> None:
+            self.action_pane("details")
+
+        @on(DataTable.RowHighlighted)
+        def _highlighted(self, event: DataTable.RowHighlighted) -> None:
+            # Read the cursor *now*, not the event: a table rebuild queues a transient highlight of
+            # row 0 before the cursor is restored, which would otherwise restart the log stream.
+            t = self.query_one(DataTable)
+            if not t.row_count:
+                return
+            idx = t.cursor_row
+            key = t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value
+            if key.startswith("sp:"):  # skip spacer rows in the direction of travel
+                step = 1 if idx >= self._last_index else -1
+                nxt = idx + step if 0 <= idx + step < t.row_count else idx - step
+                t.move_cursor(row=nxt, animate=False)
+                return
+            self._last_index = idx
+            if key == self.selected_key:
+                return
+            prev, self.selected_key = self.selected_key, key
+            stats = self.stats if self.show_stats else {}
+            for k, on_ in ((prev, False), (key, True)):
+                if k and k in self.row_by_key:
+                    with contextlib.suppress(Exception):
+                        t.update_cell(k, "dot", row_cells(self.row_by_key[k], stats, on_)[0])
+            self._signature = None
+            if self._detail_timer:
+                self._detail_timer.stop()
+            self._detail_timer = self.set_timer(0.15, self.show_selected)
+
+        def show_selected(self) -> None:
+            row = self.current
+            if not row:
+                return
+            self.load_details(row)
+            if self.view == "containers":
+                self.stream_logs(row)
+
+        @work(thread=True, exclusive=True, group="details")
+        def load_details(self, row: Row) -> None:
+            data = {}
+            if row.kind == "container":
+                data = inspect(self.engine, "container", row.container.id)
+            elif row.res:
+                data = inspect(self.engine, row.kind, row.res.id if row.kind != "volume" else row.res.id)
+            self.call_from_thread(self._show_details, row, data)
+
+        def _show_details(self, row: Row, data: dict) -> None:
+            if row.key != self.selected_key:
+                return
+            self.query_one("#details-body", Static).update(details_renderable(row, data, self))
+            raw = data or (row.project.services.get(row.service, {}) if row.project and row.service else {})
+            if row.kind == "group" and row.project:
+                raw = {"name": row.project.name, "working_dir": row.project.working_dir,
+                       "config_files": row.project.config_files, "services": row.project.services or None}
+            self.query_one("#inspect-body", Static).update(
+                Syntax(json.dumps(raw, indent=2, default=str), "json", theme="ansi_dark", background_color="default"))
+
+        @work(exclusive=True, group="logs")
+        async def stream_logs(self, row: Row) -> None:
+            log = self.query_one(RichLog)
+            log.clear()
+            if row.kind == "container":
+                cmd = [self.engine.name, "logs", "-f", "--tail", "300", row.container.id]
+            elif row.kind == "group" and row.project:
+                base, _ = compose_base(self.engine, row.project)
+                cmd = base + ["logs", "-f", "--tail", "50"]
+            else:
+                log.write(Text("Not created yet — press U to bring it up.", style=MUTED))
+                return
+            proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.STDOUT,
+                                                        stdin=asyncio.subprocess.DEVNULL)
+            try:
+                assert proc.stdout
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    log.write(Text.from_ansi(line.decode(errors="replace").rstrip("\n")))
+            finally:
+                if proc.returncode is None:
+                    proc.kill()
+
+        # ── view actions ──
+        def action_view(self, view: str) -> None:
+            if view == self.view:
+                return
+            self.view = view
+            self.selected_key = None
+            self._signature = None
+            self.workers.cancel_group(self, "logs")
+            self.query_one(RichLog).clear()
+            if self.pane not in self.panes:
+                self.action_pane("details")
+            self.setup_columns()
+            self._apply(self.containers)  # immediate (possibly stale) render…
+            self.refresh_data()  # …then fresh data incl. images/volumes/networks
+
+        def action_toggle_scope(self) -> None:
+            if not self.cwd_project:
+                return self.notify("Not inside a compose project — already showing everything", severity="warning")
+            self.scoped = not self.scoped
+            self._apply(self.containers)
+
+        def action_pane(self, name: str) -> None:
+            if name not in self.panes:
+                return
+            self.pane = name
+            self.query_one(ContentSwitcher).current = name
+            self.update_tabbar()
+
+        def action_cycle_pane(self, step: int = 1) -> None:
+            p = self.panes
+            self.action_pane(p[(p.index(self.pane) + step) % len(p)] if self.pane in p else p[0])
+
+        def action_zoom(self) -> None:
+            self.screen.toggle_class("zoom")
+
+        def action_more(self) -> None:
+            self.show_more = not self.show_more
+            self.update_chrome()
+
+        def action_filter(self) -> None:
+            self.query_one("#filter", Input).focus()
+
+        @on(Input.Changed, "#filter")
+        def _filter_changed(self, event: Input.Changed) -> None:
+            self.filter_text = event.value
+            self._apply(self.containers)
+
+        @on(Input.Submitted, "#filter")
+        def _filter_done(self) -> None:
+            self.query_one(DataTable).focus()
+
+        def action_escape(self) -> None:
+            if self.screen.has_class("zoom"):
+                self.screen.remove_class("zoom")
+                return
+            f = self.query_one("#filter", Input)
+            if f.value or f.has_focus:
+                f.value = ""
+                self.query_one(DataTable).focus()
+
+        def action_toggle_stopped(self) -> None:
+            self.show_stopped = not self.show_stopped
+            self._apply(self.containers)
+
+        def action_toggle_stats(self) -> None:
+            self.show_stats = not self.show_stats
+            self._apply(self.containers)
+            if self.show_stats:
+                self.refresh_stats()
+
+        # ── running things ──
+        @work(thread=True)
+        def bg(self, cmd: list[str], verb: str, cwd: str | None = None) -> None:
+            self.call_from_thread(self.notify, f"{verb}…", timeout=60)
+            t0 = time.monotonic()
+            r = run(cmd, timeout=180, cwd=cwd)
+            if r.returncode == 0:
+                self.call_from_thread(self.notify, f"{verb}  ({time.monotonic() - t0:.1f}s)", timeout=3)
+            else:
+                self.call_from_thread(self.notify, (r.stderr or r.stdout).strip()[-300:] or "failed",
+                                      title=verb, severity="error", timeout=8)
+            self.call_from_thread(self.refresh_data)
+
+        def foreground(self, cmds: list[list[str]], cwd: str | None = None, pause: str = "error") -> None:
+            """Suspend the TUI and run commands attached to the real terminal (progress bars, TTY)."""
+            con = Console()
+            rc = 0
+            with self.suspend():
+                for cmd in cmds:
+                    con.print()
+                    con.print(Text("› ", style=ACCENT) + Text(" ".join(cmd), style=MUTED))
+                    con.print()
+                    try:
+                        rc = subprocess.call(cmd, cwd=cwd)
+                    except KeyboardInterrupt:
+                        rc = 130
+                        break
+                    if rc != 0:
+                        break
+                if pause == "always" or (pause == "error" and rc not in (0, 130)):
+                    con.print()
+                    con.print(Text("✓ done" if rc == 0 else f"✗ exit {rc}", style=OK if rc == 0 else BAD)
+                              + Text("  ·  press enter to return", style=MUTED))
+                    with contextlib.suppress(EOFError, KeyboardInterrupt):
+                        input()
+            self.refresh_data()
+
+        def _target_project(self) -> Project | None:
+            row = self.current
+            if self.view == "containers" and row and row.project:
+                return row.project
+            if self.view == "containers" and row and row.container and row.container.project:
+                return self.projects.get(row.container.project)
+            return self.cwd_project
+
+        def _need_containers(self) -> bool:
+            if self.view != "containers":
+                self.notify("That works on containers — press 1", severity="warning")
+                return False
+            return True
+
+        def _container_action(self, verb: str) -> None:
+            row = self.current
+            if not self._need_containers() or not row:
+                return
+            if row.kind == "container":
+                self.bg([self.engine.name, verb, row.container.id], f"{verb} {row.label.strip()}")
+            elif row.kind == "service" and verb in ("start", "restart"):
+                self.action_up_service()
+            elif row.kind == "group" and row.project:
+                base, cwd = compose_base(self.engine, row.project)
+                self.bg(base + [verb], f"{verb} {row.project.name}", cwd)
+            else:
+                self.notify("Nothing to do for this row", severity="warning")
+
+        def action_start(self) -> None:
+            self._container_action("start")
+
+        def action_stop(self) -> None:
+            self._container_action("stop")
+
+        def action_restart(self) -> None:
+            self._container_action("restart")
+
+        def action_remove(self) -> None:
+            row = self.current
+            if not row:
+                return
+            e = self.engine.name
+            if row.kind == "group" and row.project:
+                return self.action_down()
+            if row.kind == "container":
+                c = row.container
+                return self._confirm(Text.assemble("Force-remove container ", (c.name, "bold"), "?"),
+                                     lambda: self.bg([e, "rm", "-f", c.id], f"removed {c.name}"))
+            if not row.res:
+                return
+            r = row.res
+            if r.kind == "network" and r.extra.get("builtin"):
+                return self.notify(f"{r.name} is a built-in network", severity="warning")
+            if r.used_by or r.extra.get("elsewhere"):
+                who = names_preview(r.used_by, 3) or "containers in other stacks"
+                return self.notify(f"{r.name} is in use by {who}", severity="warning")
+            msg = Text.assemble(f"Remove {r.kind} ", (r.name, "bold"), "?")
+            if r.kind == "volume":
+                msg.append(f"\nThis deletes the data in it{' (' + fmt_size(r.size) + ')' if r.size else ''}. "
+                           "It can't be undone.", style=WARN)
+            elif r.kind == "image" and r.size:
+                msg.append(f"\nFrees about {fmt_size(r.size)}.", style=MUTED)
+            cmd = {"image": [e, "image", "rm", r.id], "volume": [e, "volume", "rm", r.id],
+                   "network": [e, "network", "rm", r.id]}[r.kind]
+            self._confirm(msg, lambda: self.bg(cmd, f"removed {r.name}"))
+
+        def _confirm(self, message: Text, then) -> None:
+            self.push_screen(Confirm(message), lambda ok: then() if ok else None)
+
+        def action_exec(self) -> None:
+            row = self.current
+            if not self._need_containers():
+                return
+            if not row or row.kind != "container":
+                return self.notify("Select a container to exec into", severity="warning")
+            if not row.container.running:
+                return self.notify(f"{row.container.name} isn't running", severity="warning")
+            shell = "if command -v bash >/dev/null 2>&1; then exec bash; else exec sh; fi"
+            self.foreground([[self.engine.name, "exec", "-it", row.container.id, "sh", "-c", shell]])
+
+        def _compose(self, args: list[str], service_scoped: bool = False, pause: str = "error") -> None:
+            p = self._target_project()
+            if not p:
+                return self.notify("No compose project here or selected", severity="warning")
+            base, cwd = compose_base(self.engine, p)
+            row = self.current
+            if service_scoped and self.view == "containers" and row and row.service and row.kind != "group":
+                args = args + [row.service]
+            self.foreground([base + args], cwd, pause)
+
+        def action_up(self) -> None:
+            self._compose(["up", "-d"])
+
+        def action_up_service(self) -> None:
+            row = self.current
+            if not self._need_containers():
+                return
+            if not row or not row.service:
+                return self.notify("Select a compose service", severity="warning")
+            self._compose(["up", "-d"], service_scoped=True)
+
+        def action_build(self) -> None:
+            self._compose(["build"], service_scoped=True, pause="always")
+
+        def action_pull(self) -> None:
+            row = self.current
+            if self.view == "images":
+                if not row or not row.res or row.res.name == "<untagged>":
+                    return self.notify("Select a tagged image to pull", severity="warning")
+                return self.foreground([[self.engine.name, "pull", row.res.name]])
+            self._compose(["pull"], service_scoped=True)
+
+        def action_down(self) -> None:
+            p = self._target_project()
+            if not p:
+                return self.notify("No compose project here or selected", severity="warning")
+            base, cwd = compose_base(self.engine, p)
+            msg = Text.assemble("compose down ", (p.name, "bold"), "?\n",
+                                ("Stops and removes its containers and networks. Volumes are kept.", MUTED))
+            self._confirm(msg, lambda: self.foreground([base + ["down"]], cwd))
+
+        # ── clean up ──
+        def action_prune(self) -> None:
+            self.notify("Measuring what can be cleaned up…", timeout=30)
+            self._load_prune()
+
+        @work(thread=True, exclusive=True, group="prune")
+        def _load_prune(self) -> None:
+            try:
+                containers = list_containers(self.engine)
+                res = load_resources(self.engine, containers)
+            except Exception as e:
+                self.call_from_thread(self.notify, str(e), severity="error", timeout=5)
+                return
+            plan = build_prune_plan(self.engine, containers, res)
+            self.call_from_thread(self._show_prune, plan)
+
+        def _show_prune(self, plan: list[PruneItem]) -> None:
+            self._flash = None
+            self.update_status()
+            self.push_screen(Prune(plan), self._prune_chosen)
+
+        def _prune_chosen(self, chosen: list[PruneItem] | None) -> None:
+            if not chosen:
+                return
+            if any(c.key == "images" for c in chosen):  # `image prune -a` already covers dangling ones
+                chosen = [c for c in chosen if c.key != "dangling"]
+            msg = Text("This will run:\n\n", style="bold")
+            for it in chosen:
+                msg.append("  " + " ".join(it.cmd) + "\n", style="")
+                if it.warn:
+                    msg.append(f"  ⚠ {it.warn}\n", style=WARN)
+            self._confirm(msg, lambda: self.foreground([it.cmd for it in chosen], pause="always"))
+
+    return Dkr()
+
+
+def tui_main(engine: Engine, start_prune: bool = False) -> None:
+    make_app(engine, start_prune).run()
+
+
+def details_renderable(row: Row, data: dict, app) -> Group | Text:
+    grid = Table.grid(padding=(0, 3))
+    grid.add_column(style=MUTED, no_wrap=True)
+    grid.add_column()
+
+    def hint(*pairs: tuple[str, str]) -> Text:
+        t = Text("\n")
+        for i, (k, label) in enumerate(pairs):
+            if i:
+                t.append("  ·  ", style=MUTED)
+            t.append(k)
+            t.append(f" {label}", style=MUTED)
+        return t
+
+    def used(r: Resource) -> Text:
+        others = r.extra.get("elsewhere", 0)
+        if r.used_by:
+            t = Text("\n".join(r.used_by))
+        elif r.extra.get("count") or others:
+            t = Text(f"{r.extra.get('count') or others} container(s)")
+        else:
+            return Text("nothing — safe to remove", style=MUTED)
+        if others and r.used_by:
+            t.append(f"\n+{others} in other stacks (press g)", style=MUTED)
+        return t
+
+    if row.kind == "group":
+        p = row.project
+        if not p:
+            return Text("Containers not managed by compose.", style=MUTED)
+        grid.add_row("project", Text(p.name, style="bold"))
+        grid.add_row("directory", tilde(p.working_dir) or "—")
+        grid.add_row("files", "\n".join(tilde(f) for f in p.config_files) or "—")
+        grid.add_row("containers", f"{row.running}/{row.total} running")
+        if p.services:
+            grid.add_row("services", ", ".join(p.services))
+        return Group(grid, hint(("s x r", "whole project"), ("u", "up"), ("D", "down"), ("b", "build"),
+                                ("p", "pull"), ("l", "project logs")))
+    if row.kind == "service":
+        svc = row.project.services.get(row.service, {}) if row.project else {}
+        grid.add_row("service", Text(row.service or "", style="bold"))
+        grid.add_row("state", Text("not created", style=MUTED))
+        grid.add_row("image", str(svc.get("image") or ("build " + str((svc.get("build") or {}).get("context", "")))))
+        ports = [f"{p.get('published', '')}→{p.get('target', '')}" for p in svc.get("ports", []) if isinstance(p, dict)]
+        if ports:
+            grid.add_row("ports", "  ".join(ports))
+        return Group(grid, hint(("U", f"compose up -d {row.service}"), ("b", "build")))
+
+    if row.kind == "image":
+        r = row.res
+        grid.add_row("image", Text(r.name, style="bold"))
+        grid.add_row("id", r.id)
+        tags = data.get("RepoTags") or []
+        if len(tags) > 1:
+            grid.add_row("tags", "\n".join(tags))
+        size = fmt_size(r.extra.get("total") or r.size)
+        if r.extra.get("total", 0) > r.size > 0:
+            size += f"   ({fmt_size(r.size)} unique to this image)"
+        grid.add_row("size", size)
+        grid.add_row("created", f"{str(data.get('Created', ''))[:19].replace('T', ' ')}   {short_ago(r.created)}")
+        cfg = data.get("Config") or {}
+        if data.get("Architecture"):
+            grid.add_row("platform", f"{data.get('Os', '')}/{data.get('Architecture')}")
+        if cfg.get("Entrypoint") or cfg.get("Cmd"):
+            runs = " ".join((cfg.get("Entrypoint") or []) + (cfg.get("Cmd") or []))
+            grid.add_row("runs", Text(runs, overflow="fold"))
+        if cfg.get("ExposedPorts"):
+            grid.add_row("exposes", "  ".join(p.removesuffix("/tcp") for p in cfg["ExposedPorts"]))
+        grid.add_row("used by", used(r))
+        return Group(grid, hint(("d", "remove"), ("p", "pull latest")))
+
+    if row.kind == "volume":
+        r = row.res
+        grid.add_row("volume", Text(r.id, style="bold", overflow="fold"))
+        if r.extra.get("anonymous"):
+            grid.add_row("type", "anonymous (created automatically for a container)")
+        grid.add_row("size", fmt_size(r.size) if r.size else "—")
+        if r.project:
+            grid.add_row("stack", r.project)
+        grid.add_row("driver", str(r.extra.get("driver", "")))
+        grid.add_row("mountpoint", Text(str(data.get("Mountpoint") or r.extra.get("mountpoint", "")), overflow="fold"))
+        if data.get("CreatedAt"):
+            grid.add_row("created", str(data["CreatedAt"])[:19].replace("T", " "))
+        grid.add_row("used by", used(r))
+        return Group(grid, hint(("d", "remove (deletes its data)"), ("P", "clean up unused")))
+
+    if row.kind == "network":
+        r = row.res
+        grid.add_row("network", Text(r.name, style="bold"))
+        grid.add_row("id", r.id)
+        grid.add_row("driver", f"{r.extra.get('driver', '')}   scope {r.extra.get('scope', '')}"
+                     + ("   internal" if r.extra.get("internal") else ""))
+        if r.project:
+            grid.add_row("stack", r.project)
+        cfgs = ((data.get("IPAM") or {}).get("Config") or [])
+        if cfgs:
+            grid.add_row("subnet", "  ".join(f"{c.get('Subnet', '')} gw {c.get('Gateway', '')}".strip() for c in cfgs))
+        attached = data.get("Containers") or {}
+        if attached:
+            grid.add_row("containers", "\n".join(f"{v.get('Name')}  {str(v.get('IPv4Address', '')).split('/')[0]}"
+                                                 for v in attached.values()))
+        else:
+            none = "none (built-in network)" if r.extra.get("builtin") else "none"
+            grid.add_row("containers", Text(none, style=MUTED))
+        return Group(grid, hint(("d", "remove"),))
+
+    c = row.container
+    if not data:
+        grid.add_row("name", c.name)
+        grid.add_row("status", c.status)
+        return grid
+    cfg, st = data.get("Config", {}), data.get("State", {})
+    hc, net = data.get("HostConfig", {}), data.get("NetworkSettings", {})
+    grid.add_row("name", Text(c.name, style="bold"))
+    grid.add_row("id", c.id)
+    grid.add_row("image", cfg.get("Image") or c.image)
+    status = fmt_status(c.status, c.state)
+    if st.get("Health"):
+        status.append(f"   health {st['Health'].get('Status')}", style=MUTED)
+    grid.add_row("status", status)
+    if c.project:
+        grid.add_row("compose", f"{c.project} / {c.service}")
+    grid.add_row("created", str(data.get("Created", ""))[:19].replace("T", " "))
+    cmd = " ".join([str(data.get("Path", ""))] + [str(a) for a in data.get("Args") or []])
+    grid.add_row("command", Text(cmd, overflow="fold"))
+    grid.add_row("ports", fmt_ports(c.ports, published_only=False) or "—")
+    nets = net.get("Networks") or {}
+    if nets:
+        grid.add_row("networks", "  ".join(f"{n} {v.get('IPAddress') or ''}".strip() for n, v in nets.items()))
+    mounts = data.get("Mounts") or []
+    if mounts:
+        lines = []
+        for m in mounts:
+            src = m.get("Name") if m.get("Type") == "volume" else tilde(str(m.get("Source", "")))
+            lines.append(f"{src} → {m.get('Destination')}{'' if m.get('RW', True) else ' (ro)'}")
+        grid.add_row("mounts", "\n".join(lines))
+    rp = (hc.get("RestartPolicy") or {}).get("Name")
+    if rp:
+        grid.add_row("restart", rp)
+    if c.id in app.stats:
+        cpu, mem = app.stats[c.id]
+        grid.add_row("cpu / mem", f"{cpu}  ·  {mem}")
+    return grid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────────────────
+
+HELP = """[bold]dkr[/] — a readable dashboard for Docker / Podman + Compose
+
+  [bold]dkr[/]                  full-screen dashboard
+  [bold]dkr ps[/] [#a0a0a0][-a] [-g][/]      readable container list (-a include stopped, -g all stacks)
+  [bold]dkr prune[/]            clean up disk space, with an explanation of each option
+  [bold]dkr[/] [#a0a0a0]<args…>[/]          passthrough to `compose <args>` in a compose project, else `{engine} <args>`
+
+  Inside a compose project dkr shows only that stack; press [bold]g[/] (or use -g) to see everything.
+
+[bold]Dashboard keys[/]
+  1-4 containers / images / volumes / networks      g this stack ↔ all
+  s start   x stop   r restart   e exec shell   d remove   P clean up
+  u compose up -d   U up selected service   D compose down   b build   p pull
+  tab cycle details/logs/inspect   z zoom pane   / filter   a show/hide stopped
+  t toggle CPU/mem   ctrl+p command palette   ? more keys   q quit
+
+  Set DKR_ENGINE=podman to force podman.
+"""
+
+
+def main(argv: list[str]) -> None:
+    if argv and argv[0] in ("-h", "--help", "help"):
+        Console().print(HELP.replace("{engine}", "docker"))
+        return
+    engine = detect_engine()
+    if not argv:
+        if not sys.stdout.isatty():
+            return render_ps(engine, show_stopped=True)
+        return tui_main(engine)
+    if argv[0] == "ps" and set(argv[1:]) <= {"-a", "--all", "-g", "--global", "-ag", "-ga"}:
+        flags = "".join(a.lstrip("-") for a in argv[1:])
+        return render_ps(engine, show_stopped="a" in flags or "all" in argv[1:],
+                         all_stacks="g" in flags or "--global" in argv[1:])
+    if argv[0] == "prune" and len(argv) == 1:
+        return tui_main(engine, start_prune=True)
+    cmd = engine.compose + argv if find_compose_file() else [engine.name] + argv
+    os.execvp(cmd[0], cmd)
+
+
+if __name__ == "__main__":
+    try:
+        main(sys.argv[1:])
+    except KeyboardInterrupt:
+        pass
+    except RuntimeError as e:
+        sys.exit(f"dkr: {e}")

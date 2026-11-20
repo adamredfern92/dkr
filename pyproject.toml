@@ -1,0 +1,13 @@
+# dkr is a single self-contained script (`./dkr`, dependencies declared inline via PEP 723).
+# This file only holds tool configuration for development.
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+include = ["dkr", "tests/*.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "B", "UP", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
